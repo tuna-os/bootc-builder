@@ -1,0 +1,383 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Default values
+ARCH="x86_64"
+OUTPUT_DIR="."
+VERBOSE=false
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print colored output
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Show usage information
+show_usage() {
+    cat << EOF
+bootc-builder - A wrapper for Titanoboa and Bootc-image-builder
+
+USAGE:
+    bootc-builder build <IMAGE_URI> --type <TYPE> [OPTIONS]
+
+ARGS:
+    <IMAGE_URI>    Container image URI (e.g., ghcr.io/ublue-os/bluefin:latest)
+
+OPTIONS:
+    --type <TYPE>        Build type: iso, live-iso, qcow2, raw
+    --arch <ARCH>        Target architecture: x86_64, aarch64 (default: x86_64)
+    --output-dir <DIR>   Output directory (default: current directory)
+    --verbose            Enable verbose output
+    -h, --help           Show this help message
+
+EXAMPLES:
+    # Create an Anaconda ISO using bootc-image-builder
+    bootc-builder build ghcr.io/ublue-os/bluefin:latest --type iso --arch x86_64 --output-dir /tmp
+
+    # Create a live ISO using Titanoboa
+    bootc-builder build ghcr.io/ublue-os/bluefin:lts --type live-iso --arch aarch64 --output-dir /tmp
+
+    # Create a qcow2 disk image
+    bootc-builder build ghcr.io/ublue-os/bluefin:latest --type qcow2 --output-dir /tmp
+
+REQUIREMENTS:
+    - podman
+
+EOF
+}
+
+# Check if podman is available
+check_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v podman &> /dev/null; then
+        missing_deps+=("podman")
+    fi
+    
+    if ! command -v just &> /dev/null; then
+        missing_deps+=("just")
+    fi
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        print_error "The following required dependencies are missing:"
+        for dep in "${missing_deps[@]}"; do
+            print_error "  - $dep"
+        done
+        print_error ""
+        print_error "Please install the missing dependencies:"
+        print_error "  - podman: Container runtime (https://podman.io/getting-started/installation)"
+        print_error "  - just: Command runner (https://github.com/casey/just#installation)"
+        exit 1
+    fi
+}
+
+# Parse command line arguments
+parse_args() {
+    if [ $# -eq 0 ]; then
+        show_usage
+        exit 1
+    fi
+
+    case "$1" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        build)
+            shift
+            ;;
+        *)
+            print_error "Unknown command: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+
+    if [ $# -eq 0 ]; then
+        print_error "Missing image URI"
+        show_usage
+        exit 1
+    fi
+
+    IMAGE_URI="$1"
+    shift
+
+    # Parse remaining options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --type)
+                if [ -z "${2:-}" ]; then
+                    print_error "--type requires a value"
+                    exit 1
+                fi
+                TYPE="$2"
+                shift 2
+                ;;
+            --arch)
+                if [ -z "${2:-}" ]; then
+                    print_error "--arch requires a value"
+                    exit 1
+                fi
+                ARCH="$2"
+                shift 2
+                ;;
+            --output-dir)
+                if [ -z "${2:-}" ]; then
+                    print_error "--output-dir requires a value"
+                    exit 1
+                fi
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate required parameters
+    if [ -z "${TYPE:-}" ]; then
+        print_error "--type is required"
+        show_usage
+        exit 1
+    fi
+
+    # Validate type
+    case "$TYPE" in
+        iso|live-iso|qcow2|raw)
+            ;;
+        *)
+            print_error "Invalid type: $TYPE. Must be one of: iso, live-iso, qcow2, raw"
+            exit 1
+            ;;
+    esac
+
+    # Validate architecture
+    case "$ARCH" in
+        x86_64|aarch64)
+            ;;
+        *)
+            print_error "Invalid architecture: $ARCH. Must be one of: x86_64, aarch64"
+            exit 1
+            ;;
+    esac
+}
+
+# Create configuration file for bootc-image-builder (iso, qcow2, raw)
+create_bootc_config() {
+    local config_file="$1"
+    local build_type="$2"
+    
+    case "$build_type" in
+        iso)
+            cat > "$config_file" << EOF
+[customizations.installer.kickstart]
+contents = """
+%post
+bootc switch --mutate-in-place --transport registry --enforce-container-sigpolicy $IMAGE_URI
+%end
+"""
+
+[customizations.installer.modules]
+enable = [
+  "org.fedoraproject.Anaconda.Modules.Storage"
+]
+disable = [
+  "org.fedoraproject.Anaconda.Modules.Network",
+  "org.fedoraproject.Anaconda.Modules.Security",
+  "org.fedoraproject.Anaconda.Modules.Services",
+  "org.fedoraproject.Anaconda.Modules.Users",
+  "org.fedoraproject.Anaconda.Modules.Subscription",
+  "org.fedoraproject.Anaconda.Modules.Timezone"
+]
+EOF
+            ;;
+        qcow2|raw)
+            cat > "$config_file" << EOF
+[[customizations.user]]
+name = "centos"
+password = "centos"
+groups = ["wheel"]
+
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "20 GiB"
+EOF
+            ;;
+    esac
+}
+
+# Build using bootc-image-builder (for iso, qcow2, raw)
+build_with_bootc() {
+    local build_type="$1"
+    local config_file="bootc-config.toml"
+    
+    print_info "Creating configuration file for $build_type build..."
+    create_bootc_config "$config_file" "$build_type"
+    
+    if [ "$VERBOSE" = true ]; then
+        print_info "Configuration file content:"
+        cat "$config_file"
+        echo
+    fi
+    
+    print_info "Pulling image: $IMAGE_URI"
+    podman pull "$IMAGE_URI"
+    
+    print_info "Building $build_type image with bootc-image-builder..."
+    
+    local podman_args=(
+        "run" "--rm" "-it" "--privileged"
+        "-v" "$OUTPUT_DIR:/output"
+        "-v" "/var/lib/containers/storage:/var/lib/containers/storage"
+        "-v" "$(pwd)/$config_file:/config.toml"
+        "quay.io/centos-bootc/bootc-image-builder:latest"
+        "build" "--type" "$build_type" "--rootfs" "xfs"
+    )
+    
+    # Add architecture if not x86_64
+    if [ "$ARCH" != "x86_64" ]; then
+        podman_args+=("--target-arch" "$ARCH")
+    fi
+    
+    podman_args+=("--use-librepo=False" "$IMAGE_URI")
+    
+    if [ "$VERBOSE" = true ]; then
+        print_info "Running command: podman ${podman_args[*]}"
+    fi
+    
+    podman "${podman_args[@]}"
+    
+    # Clean up config file
+    rm -f "$config_file"
+}
+
+# Build using Titanoboa (for live-iso)
+build_with_titanoboa() {
+    print_info "Building live ISO with Titanoboa..."
+    
+    # Check if we have just installed
+    if ! command -v just &> /dev/null; then
+        print_error "just is required for Titanoboa but not installed. Please install just first."
+        exit 1
+    fi
+    
+    # Get the absolute path to the titanoboa directory
+    local titanoboa_dir="$(realpath "$(dirname "$0")/titanoboa")"
+    
+    if [ ! -d "$titanoboa_dir" ]; then
+        print_error "Titanoboa directory not found at $titanoboa_dir"
+        print_error "Make sure the titanoboa submodule is initialized: git submodule update --init --recursive"
+        exit 1
+    fi
+    
+    # Change to titanoboa directory
+    cd "$titanoboa_dir" || exit 1
+    
+    print_info "Using Titanoboa directory: $titanoboa_dir"
+    
+    # Set up Titanoboa environment variables
+    local titanoboa_workdir="$OUTPUT_DIR/titanoboa-work"
+    local titanoboa_iso_root="$titanoboa_workdir/iso-root"
+    
+    export TITANOBOA_WORKDIR="$titanoboa_workdir"
+    export TITANOBOA_ISO_ROOT="$titanoboa_iso_root"
+    
+    # Construct just build arguments
+    local just_args=("$IMAGE_URI")
+    
+    # Add architecture support if not x86_64
+    # Note: Titanoboa may not support --target-arch directly, so we might need to handle this differently
+    if [ "$ARCH" != "x86_64" ]; then
+        print_warning "Architecture $ARCH specified. Titanoboa build may need additional configuration for non-x86_64 architectures."
+    fi
+    
+    if [ "$VERBOSE" = true ]; then
+        print_info "Running command: just build ${just_args[*]}"
+        print_info "Working directory: $titanoboa_workdir"
+        print_info "ISO root: $titanoboa_iso_root"
+    fi
+    
+    # Run Titanoboa build
+    just build "${just_args[@]}"
+    
+    # Move the generated ISO to our output directory
+    if [ -f "output.iso" ]; then
+        local final_iso_path="$OUTPUT_DIR/output.iso"
+        mv output.iso "$final_iso_path"
+        print_success "Live ISO built successfully: $final_iso_path"
+    else
+        print_error "Titanoboa build completed but output.iso not found"
+        exit 1
+    fi
+    
+    # Return to original directory
+    cd - > /dev/null || exit 1
+}
+
+# Main build function
+build_image() {
+    # Ensure output directory exists
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        print_info "Creating output directory: $OUTPUT_DIR"
+        mkdir -p "$OUTPUT_DIR"
+    fi
+    
+    # Get absolute path for output directory
+    OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
+    
+    print_info "Building $TYPE image for $ARCH architecture"
+    print_info "Image URI: $IMAGE_URI"
+    print_info "Output directory: $OUTPUT_DIR"
+    echo
+    
+    case "$TYPE" in
+        live-iso)
+            build_with_titanoboa
+            ;;
+        iso|qcow2|raw)
+            build_with_bootc "$TYPE"
+            ;;
+    esac
+    
+    print_success "Build completed! Check $OUTPUT_DIR for the generated image."
+}
+
+# Main function
+main() {
+    check_dependencies
+    parse_args "$@"
+    build_image
+}
+
+# Run main function with all arguments
+main "$@"
